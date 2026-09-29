@@ -1,7 +1,10 @@
+import math
+
 import numpy as np
 import pytest
 
-from costmap_core.inflation import InflationError, inflate_costmap
+from costmap_core.class_to_cost import require_cost
+from costmap_core.inflation import DEFAULT_LETHAL_COST, InflationError, inflate_costmap
 
 LETHAL = 254
 
@@ -126,3 +129,70 @@ def test_corner_obstacle_does_not_crash_and_clips_to_grid_bounds():
     assert result[1, 1] == 74
     # Far corner, outside the radius, is untouched.
     assert result[4, 4] == 0
+
+
+# --- lethal_cost validation ---------------------------------------------------
+
+
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [True, False, np.bool_(True), 254.0, 253.5, "254", math.nan, math.inf, -math.inf, None],
+    ids=["True", "False", "np_bool", "float_integral", "float", "str", "nan", "inf", "-inf", "None"],
+)
+def test_non_integer_lethal_cost_rejected(bad):
+    grid = np.zeros((3, 3), dtype=np.int64)
+    with pytest.raises(InflationError, match="lethal_cost must be an integer cost"):
+        inflate_costmap(grid, resolution=1.0, inflation_radius=1.0, lethal_cost=bad)
+
+
+@pytest.mark.parametrize("bad", [-1, -254, 256, 1000, np.int64(-1), np.uint16(256)])
+def test_out_of_range_lethal_cost_rejected(bad):
+    grid = np.zeros((3, 3), dtype=np.int64)
+    with pytest.raises(InflationError, match="lethal_cost must be in 0..255"):
+        inflate_costmap(grid, resolution=1.0, inflation_radius=1.0, lethal_cost=bad)
+
+
+def test_bool_lethal_cost_cannot_match_cost_one_cells():
+    """lethal_cost=True used to compare equal to cost 1 and inflate around it."""
+    grid = np.zeros((3, 3), dtype=np.int64)
+    grid[1, 1] = 1
+    with pytest.raises(InflationError):
+        inflate_costmap(grid, resolution=1.0, inflation_radius=2.0, lethal_cost=True)
+
+
+def test_lethal_cost_rejected_even_with_zero_radius():
+    """Validation does not depend on whether any inflation work happens."""
+    with pytest.raises(InflationError, match="lethal_cost"):
+        inflate_costmap(np.zeros((2, 2), dtype=np.int64), resolution=1.0, inflation_radius=0.0,
+                        lethal_cost=300)
+
+
+@pytest.mark.parametrize("valid", [0, 1, 200, 254, 255, np.uint8(254), np.int64(200)])
+def test_valid_lethal_cost_accepted_and_numpy_ints_match_python_ints(valid):
+    grid = np.zeros((5, 5), dtype=np.int64)
+    grid[2, 2] = int(valid)
+    as_given = inflate_costmap(grid, resolution=1.0, inflation_radius=2.0, lethal_cost=valid)
+    as_int = inflate_costmap(grid, resolution=1.0, inflation_radius=2.0, lethal_cost=int(valid))
+    np.testing.assert_array_equal(as_given, as_int)
+    assert as_given[2, 2] == int(valid)
+
+
+def test_default_lethal_cost_unchanged_and_valid():
+    assert DEFAULT_LETHAL_COST == 254
+    assert require_cost(DEFAULT_LETHAL_COST, name="lethal_cost") == 254
+    grid = np.zeros((5, 5), dtype=np.int64)
+    grid[2, 2] = 254
+    np.testing.assert_array_equal(
+        inflate_costmap(grid, resolution=1.0, inflation_radius=2.0),
+        inflate_costmap(grid, resolution=1.0, inflation_radius=2.0, lethal_cost=254),
+    )
+
+
+def test_rejected_call_does_not_mutate_costmap():
+    grid = np.full((3, 3), 7, dtype=np.int64)
+    before = grid.copy()
+    with pytest.raises(InflationError):
+        inflate_costmap(grid, resolution=1.0, inflation_radius=1.0, lethal_cost=-1)
+    np.testing.assert_array_equal(grid, before)

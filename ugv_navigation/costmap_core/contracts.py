@@ -35,7 +35,7 @@ import numpy as np
 from costmap_core.class_to_cost import SemanticClass
 from costmap_core.footprint import FootprintError, Point, validate_footprint
 from costmap_core.grid import CostmapGridGeometry
-from costmap_core.projection import CameraGroundGeometry, CameraIntrinsics
+from costmap_core.projection import CameraGroundGeometry, CameraIntrinsics, CameraPose
 
 _NS_PER_S = 1_000_000_000
 _CANONICAL_IDS = frozenset(int(c) for c in SemanticClass)
@@ -175,22 +175,28 @@ class CameraGroundInput:
     owns map -> odom -> base_link; the base_link -> camera extrinsic comes
     from Dev 5's robot description. Neither is available yet.
 
-    geometry: the core's simplified pose (height above ground, downward
-        pitch; roll = yaw = 0; camera directly above the ground frame origin,
-        ground x along the camera's forward heading). See CameraGroundGeometry.
+    geometry: either the simplified CameraGroundGeometry (height above
+        ground, downward pitch; roll = yaw = 0; camera directly above the
+        ground frame origin, ground x along the camera's forward heading) or
+        a full 6-DoF CameraPose of the camera optical frame in the ground
+        frame. See projection.py.
     camera_frame_id: optical frame the pose is for (must match the mask).
     ground_frame_id: frame the projected ground points are expressed in
         (must match the grid's frame).
     stamp_ns: time the pose refers to.
     """
 
-    geometry: CameraGroundGeometry
+    geometry: CameraGroundGeometry | CameraPose
     camera_frame_id: str
     ground_frame_id: str
     stamp_ns: int
 
     def __post_init__(self) -> None:
-        _require_type(self.geometry, CameraGroundGeometry, name="geometry")
+        if not isinstance(self.geometry, (CameraGroundGeometry, CameraPose)):
+            raise ContractError(
+                "geometry must be a CameraGroundGeometry or CameraPose, "
+                f"got {type(self.geometry).__name__}"
+            )
         _require_frame_id(self.camera_frame_id, name="camera_frame_id")
         _require_frame_id(self.ground_frame_id, name="ground_frame_id")
         object.__setattr__(self, "stamp_ns", _require_stamp(self.stamp_ns, name="stamp_ns"))
@@ -242,6 +248,44 @@ class OccupancyInput:
         if occupied.ndim != 2:
             raise ContractError(f"occupied must be 2D, got shape {occupied.shape}")
         object.__setattr__(self, "occupied", _readonly_copy(occupied))
+        object.__setattr__(self, "stamp_ns", _require_stamp(self.stamp_ns, name="stamp_ns"))
+        object.__setattr__(self, "frame_id", _require_frame_id(self.frame_id, name="frame_id"))
+
+
+@dataclass(frozen=True, eq=False)
+class PointCloudInput:
+    """Unorganised 3D points from a geometry side-channel, not yet rasterised.
+
+    Source (Dev 1, available): `/perception/depth_cloud`
+    (sensor_msgs/PointCloud2, x/y/z float32, metres, camera optical frame).
+    Dev 1 omits invalid/sky points instead of publishing NaN, so every stored
+    point is finite. It is not yet transformed, filtered or rasterised into an
+    OccupancyInput; those stages need TF and thresholds that are PENDING.
+
+    points: (N, 3) floating-point array of x, y, z in metres, in frame_id.
+        N may be 0. Stored as a read-only copy with the caller's dtype.
+    stamp_ns: time the points refer to (source image capture, header.stamp).
+    frame_id: frame the points are expressed in (header.frame_id).
+
+    An empty cloud means "nothing observed", never free space: absent points
+    say nothing about the cells they would have fallen in.
+    """
+
+    points: np.ndarray
+    stamp_ns: int
+    frame_id: str
+
+    def __post_init__(self) -> None:
+        points = self.points
+        if not isinstance(points, np.ndarray):
+            raise ContractError(f"points must be a numpy ndarray, got {type(points).__name__}")
+        if not np.issubdtype(points.dtype, np.floating):
+            raise ContractError(f"points dtype must be floating-point, got {points.dtype}")
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ContractError(f"points must have shape (N, 3), got {points.shape}")
+        if not np.all(np.isfinite(points)):
+            raise ContractError("points must be finite (no NaN or Inf)")
+        object.__setattr__(self, "points", _readonly_copy(points))
         object.__setattr__(self, "stamp_ns", _require_stamp(self.stamp_ns, name="stamp_ns"))
         object.__setattr__(self, "frame_id", _require_frame_id(self.frame_id, name="frame_id"))
 

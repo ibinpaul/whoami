@@ -18,6 +18,7 @@ from costmap_core.contracts import (
     FootprintInput,
     GridInput,
     OccupancyInput,
+    PointCloudInput,
     SemanticMaskInput,
     age_s,
     is_fresh,
@@ -194,6 +195,10 @@ def test_grid_shape_is_height_width():
         dict(occupied=np.zeros((10, 20), dtype=np.uint8)),  # 0/1 ints not accepted
         dict(occupied=np.zeros((10,), dtype=bool)),
         dict(occupied=[[False]]),
+        dict(occupied=np.zeros((10, 20), dtype=np.float64)),
+        dict(occupied=np.zeros((10, 20), dtype=np.int64)),
+        dict(occupied=np.zeros((10, 20), dtype=object)),
+        dict(occupied=np.zeros((2, 10, 20), dtype=bool)),
         dict(stamp_ns=-5),
         dict(frame_id=""),
     ],
@@ -232,6 +237,52 @@ def test_footprint_rejects_invalid_polygon(vertices):
 def test_footprint_rejects_empty_frame():
     with pytest.raises(ContractError):
         FootprintInput(vertices=[(1, 1), (-1, 1), (-1, -1)], frame_id="")
+
+
+
+@pytest.mark.parametrize(
+    "vertices",
+    [
+        [],
+        [(0, 0), (1, 0), (math.nan, 1)],
+        [(0, 0), (1, 0), (1, math.inf)],
+        [(0, 0), (1, 0), (1, 0), (0, 1)],  # repeated consecutive vertex
+        [(0, 0), (1, 1), (1, 0), (0, 1)],  # bow-tie
+        [(0, 0), (1, 0), (0, 1, 2)],  # malformed vertex
+    ],
+)
+def test_footprint_input_rejects_invalid_vertices_as_contract_error(vertices):
+    with pytest.raises(ContractError, match="invalid footprint"):
+        FootprintInput(vertices=vertices, frame_id="test_robot")
+
+
+@pytest.mark.parametrize("frame_id", [None, 0, b"test_robot"])
+def test_footprint_rejects_non_str_frame(frame_id):
+    with pytest.raises(ContractError, match="frame_id"):
+        FootprintInput(vertices=[(1, 1), (-1, 1), (-1, -1)], frame_id=frame_id)
+
+
+def test_footprint_input_is_immutable_and_detached_from_source():
+    source = [[1, 1], [-1, 1], [-1, -1]]
+    fp = FootprintInput(vertices=source, frame_id="test_robot")
+    source[0][0] = 99
+    source.append([5, 5])
+    assert fp.vertices == ((1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0))
+    assert isinstance(fp.vertices, tuple) and all(isinstance(v, tuple) for v in fp.vertices)
+    with pytest.raises(AttributeError):
+        fp.vertices = ()
+    with pytest.raises(AttributeError):
+        fp.frame_id = "other"
+
+
+def test_footprint_has_no_defaults():
+    import dataclasses
+
+    for field in dataclasses.fields(FootprintInput):
+        assert field.default is dataclasses.MISSING, field.name
+        assert field.default_factory is dataclasses.MISSING, field.name
+    with pytest.raises(TypeError):
+        FootprintInput()  # type: ignore[call-arg]
 
 
 # --- CostmapCoreInputs cross-checks ------------------------------------------
@@ -329,3 +380,94 @@ def test_is_fresh_rejects_bad_max_age(max_age):
 def test_age_rejects_bad_stamps(stamp, now):
     with pytest.raises(ContractError):
         age_s(stamp, now)
+
+
+# --- PointCloudInput ---------------------------------------------------------
+
+
+def make_cloud(**overrides):
+    kwargs = dict(
+        points=np.array([[1.0, 2.0, 3.0], [-0.5, 0.25, 4.0]], dtype=np.float32),
+        stamp_ns=STAMP,
+        frame_id=CAM,
+    )
+    kwargs.update(overrides)
+    return PointCloudInput(**kwargs)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_cloud_accepts_n_by_3_floats_and_keeps_dtype(dtype):
+    points = np.arange(12, dtype=dtype).reshape(4, 3)
+    cloud = make_cloud(points=points)
+    assert cloud.points.shape == (4, 3)
+    assert cloud.points.dtype == dtype
+    np.testing.assert_array_equal(cloud.points, points)
+    assert cloud.stamp_ns == STAMP
+    assert cloud.frame_id == CAM
+
+
+def test_cloud_accepts_empty():
+    cloud = make_cloud(points=np.empty((0, 3), dtype=np.float32))
+    assert cloud.points.shape == (0, 3)
+
+
+def test_cloud_is_readonly_copy():
+    source = np.zeros((2, 3), dtype=np.float32)
+    cloud = make_cloud(points=source)
+    source[0, 0] = 9.0
+    assert cloud.points[0, 0] == 0.0
+    assert source.flags.writeable
+    with pytest.raises(ValueError):
+        cloud.points[0, 0] = 1.0
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        [[1.0, 2.0, 3.0]],
+        np.zeros((2, 3), dtype=np.int32),
+        np.zeros((2, 3), dtype=np.uint8),
+        np.zeros((2, 3), dtype=bool),
+        np.zeros((2, 3), dtype=object),
+        np.full((2, 3), "1.0"),
+        np.zeros((2, 3), dtype=np.complex128),
+        np.zeros((3,), dtype=np.float32),
+        np.zeros((2, 2), dtype=np.float32),
+        np.zeros((2, 4), dtype=np.float32),
+        np.zeros((1, 2, 3), dtype=np.float32),
+        np.empty((0,), dtype=np.float32),
+    ],
+)
+def test_cloud_rejects_bad_points(points):
+    with pytest.raises(ContractError):
+        make_cloud(points=points)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_cloud_rejects_non_finite_points(bad):
+    points = np.ones((3, 3), dtype=np.float32)
+    points[1, 2] = bad
+    with pytest.raises(ContractError, match="finite"):
+        make_cloud(points=points)
+
+
+@pytest.mark.parametrize("overrides", [dict(stamp_ns=0), dict(stamp_ns=1.5), dict(frame_id="")])
+def test_cloud_rejects_bad_stamp_or_frame(overrides):
+    with pytest.raises(ContractError):
+        make_cloud(**overrides)
+
+
+def test_cloud_has_no_defaults():
+    import dataclasses
+
+    for field in dataclasses.fields(PointCloudInput):
+        assert field.default is dataclasses.MISSING, field.name
+        assert field.default_factory is dataclasses.MISSING, field.name
+
+
+def test_empty_cloud_is_not_occupancy():
+    # A cloud (empty or not) is unrasterised geometry. It can never stand in
+    # for an OccupancyInput, so an empty cloud cannot clear any cell.
+    empty = make_cloud(points=np.empty((0, 3), dtype=np.float32))
+    with pytest.raises(ContractError, match="occupancy"):
+        make_inputs(occupancy=empty)

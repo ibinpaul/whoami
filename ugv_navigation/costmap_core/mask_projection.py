@@ -11,8 +11,18 @@ stages into the one pipeline described in PROJECT_CONTEXT.md's Dev 3 flow:
         -> semantic cost written into that cell (class_to_cost.class_to_cost)
 
 This module is ROS-independent: it does not touch sensor_msgs, TF, real
-camera calibration, Depth Anything, or inflation. It only combines numpy
-arrays and the existing plain-Python/numpy geometry helpers.
+camera calibration, Depth Anything, or inflation.
+
+The whole mask is processed as numpy arrays in one pass. Each step performs
+the same float64 operations, in the same order, as the single-pixel helpers
+it mirrors (`projection.pixel_to_camera_ray`,
+`projection.camera_ray_to_ground_point`, `grid.world_to_grid_cell`), so
+results match them exactly, cell for cell. In particular every ray is
+rotated with numpy matmul of a 3x3 matrix by a (3, 1) vector -- the same
+kernel as the single-pixel `rotation @ ray` -- rather than a batched
+`rays @ R.T`, whose different summation order can move a ground point by
+one ulp across a cell boundary. tests/mask_projection_reference.py keeps
+the original per-pixel loop for comparison.
 """
 
 from __future__ import annotations
@@ -26,12 +36,14 @@ from costmap_core.class_to_cost import (
     SemanticClass,
     class_to_cost,
 )
-from costmap_core.grid import CostmapGridGeometry, GridError, world_to_grid_cell
+from costmap_core.grid import CostmapGridGeometry
 from costmap_core.projection import (
+    _MIN_DOWNWARD_Z_COMPONENT,
+    _OPTICAL_TO_LEVEL_WORLD,
     CameraGroundGeometry,
     CameraIntrinsics,
-    ProjectionError,
-    project_pixel_to_ground,
+    CameraPose,
+    _pitch_rotation,
 )
 
 # Precedence used when more than one mask pixel projects into the same cell:
@@ -49,7 +61,7 @@ SEMANTIC_CLASS_PRECEDENCE = {
 def project_mask_to_costmap(
     mask: np.ndarray,
     intrinsics: CameraIntrinsics,
-    geometry: CameraGroundGeometry,
+    geometry: CameraGroundGeometry | CameraPose,
     grid_geometry: CostmapGridGeometry,
     cost_values: CostValues = DEFAULT_COST_VALUES,
 ) -> np.ndarray:
@@ -61,8 +73,9 @@ def project_mask_to_costmap(
             (row, col) is treated as image coordinates (u=col, v=row) --
             the same convention `projection.py` expects.
         intrinsics: pinhole camera intrinsics (see `projection.py`).
-        geometry: camera pose relative to the ground plane (see
-            `projection.py`).
+        geometry: camera pose relative to the ground plane: either the
+            height + pitch CameraGroundGeometry or a 6-DoF CameraPose in
+            the grid's frame (see `projection.py`).
         grid_geometry: costmap grid geometry (see `grid.py`).
         cost_values: cost values for each canonical class; defaults to
             `class_to_cost.DEFAULT_COST_VALUES`.
@@ -106,30 +119,134 @@ def project_mask_to_costmap(
 
     shape = (grid_geometry.height, grid_geometry.width)
     costmap = np.full(shape, cost_values.unknown_cost, dtype=np.int64)
-    # Precedence rank of the class currently held by each cell; -1 = untouched.
-    winning_rank = np.full(shape, -1, dtype=np.int64)
+    if mask.size == 0:
+        return costmap
 
-    height, width = mask.shape
-    for row in range(height):
-        for col in range(width):
-            class_id = int(mask[row, col])
-            cost = class_to_cost(class_id, cost_values)
-            rank = SEMANTIC_CLASS_PRECEDENCE[SemanticClass(class_id)]
+    class_ids = _validated_class_ids(mask, geometry, cost_values)
+    rays = _pixel_rays(mask.shape, intrinsics)
+    hits, ground_x, ground_y = _rays_to_ground(rays, geometry)
+    in_grid, flat_cells = _ground_to_flat_cells(ground_x, ground_y, grid_geometry)
 
-            try:
-                ground_point = project_pixel_to_ground(
-                    float(col), float(row), intrinsics, geometry
-                )
-            except ProjectionError:
-                continue  # ray does not intersect the ground; skip this pixel
+    ranks = _CLASS_RANK[class_ids[hits][in_grid]]
+    # Highest precedence rank per cell; -1 = no pixel reached the cell.
+    winning_rank = np.full(costmap.size, -1, dtype=np.int64)
+    np.maximum.at(winning_rank, flat_cells, ranks)
 
-            try:
-                cell = world_to_grid_cell(ground_point.x, ground_point.y, grid_geometry)
-            except GridError:
-                continue  # outside the grid; skip, never clamp
-
-            if rank > winning_rank[cell.row, cell.col]:
-                costmap[cell.row, cell.col] = cost
-                winning_rank[cell.row, cell.col] = rank
-
+    flat_costmap = costmap.reshape(-1)
+    for semantic_class, cost in cost_values.as_mapping().items():
+        cells = winning_rank == SEMANTIC_CLASS_PRECEDENCE[semantic_class]
+        if cells.any():
+            flat_costmap[cells] = cost
     return costmap
+
+
+_VALID_CLASS_IDS = tuple(int(c) for c in SemanticClass)
+# Precedence rank indexed by class id.
+_CLASS_RANK = np.array(
+    [SEMANTIC_CLASS_PRECEDENCE[SemanticClass(i)] for i in range(len(SemanticClass))],
+    dtype=np.int64,
+)
+
+
+def _validated_class_ids(
+    mask: np.ndarray, geometry: object, cost_values: CostValues
+) -> np.ndarray:
+    """Flat int64 class ids of a non-empty 2D mask, in row-major order.
+
+    Errors are raised in the same order as the original per-pixel loop,
+    which checked pixel 0's class, then the geometry type (on its first
+    projection), then every later pixel's class in row-major order:
+    InvalidSemanticClassError (via class_to_cost) for the first invalid id,
+    TypeError for a wrong geometry type. Class ids are int(value), as before.
+    """
+    class_to_cost(int(mask.flat[0]), cost_values)
+    if not isinstance(geometry, (CameraGroundGeometry, CameraPose)):
+        raise TypeError(
+            "geometry must be a CameraGroundGeometry or CameraPose, "
+            f"got {type(geometry).__name__}"
+        )
+
+    if mask.dtype.kind in "biu":
+        flat = mask.reshape(-1)
+        valid = (flat >= 0) & (flat <= _VALID_CLASS_IDS[-1])
+        if not valid.all():
+            class_to_cost(int(flat[np.argmin(valid)]), cost_values)
+        return flat.astype(np.int64)
+
+    # Other dtypes (float, object, ...): int() per pixel, exactly as before.
+    ids = np.empty(mask.size, dtype=np.int64)
+    for i, value in enumerate(mask.flat):
+        class_id = int(value)
+        if class_id not in _VALID_CLASS_IDS:
+            class_to_cost(class_id, cost_values)
+        ids[i] = class_id
+    return ids
+
+
+def _pixel_rays(mask_shape: tuple[int, int], intrinsics: CameraIntrinsics) -> np.ndarray:
+    """(N, 3) optical-frame rays for every pixel, row-major; see pixel_to_camera_ray."""
+    height, width = mask_shape
+    u = np.arange(width, dtype=np.float64)
+    v = np.arange(height, dtype=np.float64)
+    rays = np.empty((height, width, 3), dtype=np.float64)
+    rays[:, :, 0] = ((u - intrinsics.cx) / intrinsics.fx)[np.newaxis, :]
+    rays[:, :, 1] = ((v - intrinsics.cy) / intrinsics.fy)[:, np.newaxis]
+    rays[:, :, 2] = 1.0
+    return rays.reshape(-1, 3)
+
+
+def _rotate(matrix: np.ndarray, vectors: np.ndarray) -> np.ndarray:
+    """matrix @ v for each row v of (N, 3) `vectors`, using the same (3x3 @ 3x1)
+    matmul kernel as the single-vector product so rounding is identical."""
+    return np.matmul(matrix, vectors[:, :, np.newaxis])[:, :, 0]
+
+
+def _rays_to_ground(
+    rays: np.ndarray, geometry: CameraGroundGeometry | CameraPose
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised camera_ray_to_ground_point.
+
+    Returns (hits, x, y): hits is a bool mask over the rays; x and y are the
+    ground points of the hitting rays only. A ray misses when its world z
+    component is not < -_MIN_DOWNWARD_Z_COMPONENT (the per-pixel
+    ProjectionError case).
+    """
+    if isinstance(geometry, CameraPose):
+        world = _rotate(geometry.rotation, rays)
+    else:
+        level = _rotate(_OPTICAL_TO_LEVEL_WORLD, rays)
+        world = _rotate(_pitch_rotation(geometry.pitch_rad), level)
+
+    hits = ~(world[:, 2] >= -_MIN_DOWNWARD_Z_COMPONENT)
+    world = world[hits]
+    if isinstance(geometry, CameraPose):
+        origin = geometry.translation
+        t = -origin[2] / world[:, 2]
+        return hits, origin[0] + t * world[:, 0], origin[1] + t * world[:, 1]
+    t = -geometry.camera_height / world[:, 2]
+    return hits, t * world[:, 0], t * world[:, 1]
+
+
+def _ground_to_flat_cells(
+    x: np.ndarray, y: np.ndarray, grid_geometry: CostmapGridGeometry
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised world_to_grid_cell.
+
+    Returns (in_grid, flat_cells): in_grid is a bool mask over the points;
+    flat_cells are row * width + col for the in-grid points only. Points
+    that are non-finite or outside the grid are dropped (the per-pixel
+    GridError case), never clamped.
+    """
+    with np.errstate(invalid="ignore", over="ignore"):
+        col = np.floor((x - grid_geometry.origin_x) / grid_geometry.resolution)
+        row = np.floor((y - grid_geometry.origin_y) / grid_geometry.resolution)
+        in_grid = (
+            np.isfinite(x)
+            & np.isfinite(y)
+            & (col >= 0)
+            & (col < grid_geometry.width)
+            & (row >= 0)
+            & (row < grid_geometry.height)
+        )
+    flat_cells = row[in_grid].astype(np.int64) * grid_geometry.width + col[in_grid].astype(np.int64)
+    return in_grid, flat_cells

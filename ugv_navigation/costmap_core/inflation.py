@@ -13,6 +13,12 @@ isolated in `_inflation_cost_at_distance` so it can be swapped for a real
 Nav2-compatible formula (e.g. exponential decay driven by
 `cost_scaling_factor` / `inscribed_radius`) once those parameters are
 actually specified for this project.
+
+Implementation: the cost for each (row, col) offset from a lethal cell is
+computed once, with the same scalar maths the original per-cell loop used,
+and then applied to all lethal cells at once with numpy, one offset at a
+time. The output is identical to the original loop, kept for comparison in
+tests/inflation_reference.py.
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
+
+from costmap_core.class_to_cost import require_cost
 
 DEFAULT_LETHAL_COST = 254
 
@@ -82,7 +90,8 @@ def inflate_costmap(
         resolution: grid resolution in metres/cell. Must be finite > 0.
         inflation_radius: safety buffer radius in metres. Must be finite
             and >= 0. A radius of 0 leaves the costmap unchanged.
-        lethal_cost: the cost value treated as a lethal obstacle.
+        lethal_cost: the cost value treated as a lethal obstacle, an
+            integer cost in 0..255 (class_to_cost.require_cost).
             Defaults to 254, matching `class_to_cost.CostValues` and
             `geometry_costmap.GeometryCostValues` / `costmap_fusion`.
 
@@ -92,8 +101,9 @@ def inflate_costmap(
 
     Raises:
         InflationError: if `costmap` is not 2D or has a zero-length
-            dimension, if `resolution` is not finite or <= 0, or if
-            `inflation_radius` is not finite or < 0.
+            dimension, if `resolution` is not finite or <= 0, if
+            `inflation_radius` is not finite or < 0, or if `lethal_cost`
+            is not an integer cost in 0..255.
     """
     grid = np.asarray(costmap)
 
@@ -114,27 +124,106 @@ def inflate_costmap(
     if inflation_radius < 0.0:
         raise InflationError(f"inflation_radius must be >= 0, got {inflation_radius!r}.")
 
+    lethal_cost = require_cost(lethal_cost, name="lethal_cost", error=InflationError)
+
     result = grid.astype(np.int64, copy=True)
 
-    lethal_rows, lethal_cols = np.nonzero(grid == lethal_cost)
+    lethal = grid == lethal_cost
+    lethal_rows, lethal_cols = np.nonzero(lethal)
     if lethal_rows.size == 0 or inflation_radius == 0.0:
         return result
 
     height, width = grid.shape
     radius_cells = math.ceil(inflation_radius / resolution)
+    # Offsets beyond the grid size can never land in the grid.
+    reach_rows = min(radius_cells, height - 1)
+    reach_cols = min(radius_cells, width - 1)
+    kernel = _inflation_kernel(reach_rows, reach_cols, resolution, inflation_radius, lethal_cost)
 
-    for lr, lc in zip(lethal_rows.tolist(), lethal_cols.tolist()):
-        r_min = max(0, lr - radius_cells)
-        r_max = min(height - 1, lr + radius_cells)
-        c_min = max(0, lc - radius_cells)
-        c_max = min(width - 1, lc + radius_cells)
-        for r in range(r_min, r_max + 1):
-            for c in range(c_min, c_max + 1):
-                distance_m = math.hypot((r - lr) * resolution, (c - lc) * resolution)
-                cost = int(
-                    round(_inflation_cost_at_distance(distance_m, inflation_radius, lethal_cost))
-                )
-                if cost > result[r, c]:
-                    result[r, c] = cost
+    # Every lethal cell raises each cell of its square window (clipped to the
+    # grid) to at least kernel[offset]: result = max(original, all
+    # contributions). Applied one offset at a time to all lethal cells at
+    # once; max is order-independent, so this equals the per-cell loop.
+    # Offsets whose cost cannot raise any cell (<= the smallest current
+    # cost; result only grows) are skipped.
+    floor_cost = result.min()
+    offsets = [
+        (dr, dc, int(kernel[dr + reach_rows, dc + reach_cols]))
+        for dr in range(-reach_rows, reach_rows + 1)
+        for dc in range(-reach_cols, reach_cols + 1)
+        if kernel[dr + reach_rows, dc + reach_cols] > floor_cost
+    ]
+    if not offsets:
+        return result
+    bounds = (
+        int(lethal_rows.min()), int(lethal_rows.max()) + 1,
+        int(lethal_cols.min()), int(lethal_cols.max()) + 1,
+    )
 
+    costs = [cost for _, _, cost in offsets]
+    k_min, k_max = min(costs), max(costs)
+    # Sentinel below every applied cost; non-lethal sources add -penalty so
+    # their contribution (<= k_max - penalty = sentinel) never counts.
+    sentinel, penalty = k_min - 1, k_max - k_min + 1
+    for dtype in (np.int16, np.int32):
+        info = np.iinfo(dtype)
+        if k_max <= info.max and k_min - penalty >= info.min:
+            break
+    else:
+        _apply_offsets_masked(result, lethal, offsets, bounds)
+        return result
+
+    source = np.where(lethal, 0, -penalty).astype(dtype)
+    reached = np.full(result.shape, sentinel, dtype=dtype)
+    for window, source_window, cost in _offset_windows(reached, source, offsets, bounds):
+        np.maximum(window, source_window + dtype(cost), out=window)
+    np.maximum(result, reached, out=result, where=reached > sentinel)
     return result
+
+
+def _inflation_kernel(
+    reach_rows: int,
+    reach_cols: int,
+    resolution: float,
+    inflation_radius: float,
+    lethal_cost: int,
+) -> np.ndarray:
+    """Integer inflation cost for every (row, col) offset from a lethal cell.
+
+    Shape (2 * reach_rows + 1, 2 * reach_cols + 1); centre = offset (0, 0).
+    Each entry is computed with the same scalar maths as the original
+    per-cell loop -- int(round(_inflation_cost_at_distance(math.hypot(
+    dr * resolution, dc * resolution), ...))) -- so values are identical.
+    Offsets inside the square window but beyond the radius are 0, as before.
+    Computed for dr, dc >= 0 and mirrored: (-n) * resolution == -(n *
+    resolution) exactly and math.hypot ignores signs.
+    """
+    quadrant = np.empty((reach_rows + 1, reach_cols + 1), dtype=np.int64)
+    for dr in range(reach_rows + 1):
+        for dc in range(reach_cols + 1):
+            distance_m = math.hypot(dr * resolution, dc * resolution)
+            quadrant[dr, dc] = int(
+                round(_inflation_cost_at_distance(distance_m, inflation_radius, lethal_cost))
+            )
+    rows = np.concatenate([quadrant[:0:-1], quadrant])
+    return np.concatenate([rows[:, :0:-1], rows], axis=1)
+
+
+def _offset_windows(target, source, offsets, bounds):
+    """Yield (target window, source window, cost) per offset: the target cells
+    at (row + dr, col + dc) for source cells (row, col) in the lethal bounding
+    box `bounds` = (row_lo, row_hi, col_lo, col_hi), clipped to the grid."""
+    height, width = target.shape
+    row_lo, row_hi, col_lo, col_hi = bounds
+    for dr, dc, cost in offsets:
+        r0, r1 = max(0, row_lo + dr), min(height, row_hi + dr)
+        c0, c1 = max(0, col_lo + dc), min(width, col_hi + dc)
+        if r0 < r1 and c0 < c1:
+            yield target[r0:r1, c0:c1], source[r0 - dr : r1 - dr, c0 - dc : c1 - dc], cost
+
+
+def _apply_offsets_masked(result, lethal, offsets, bounds) -> None:
+    """Fallback for kernel costs too wide for an int32 accumulator: raise
+    result in place (int64) wherever the shifted lethal mask is set."""
+    for window, lethal_window, cost in _offset_windows(result, lethal, offsets, bounds):
+        np.maximum(window, np.int64(cost), out=window, where=lethal_window)

@@ -45,9 +45,23 @@ class FootprintError(ValueError):
 def _require_finite_number(value: object, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FootprintError(f"{name} must be a real number, got {type(value).__name__}")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError as exc:  # a Python int beyond float range, e.g. 10**400
+        raise FootprintError(f"{name} is too large to represent as a float") from exc
     if not math.isfinite(value):
         raise FootprintError(f"{name} must be finite, got {value!r}")
+    return value
+
+
+def _require_finite_result(value: float, *, what: str) -> float:
+    # Finite coordinates can still overflow in products (e.g. 1e160 * 1e160),
+    # giving inf/nan that would silently pass the == 0 / > 0 checks below.
+    if not math.isfinite(value):
+        raise FootprintError(
+            f"footprint {what} is not finite ({value!r}); the coordinates are too large "
+            "to validate in floating point."
+        )
     return value
 
 
@@ -58,10 +72,10 @@ def _cross(o: Point, a: Point, b: Point) -> float:
 
 def _segments_intersect(p1: Point, p2: Point, q1: Point, q2: Point) -> bool:
     """True if closed segments p1-p2 and q1-q2 share any point."""
-    d1 = _cross(q1, q2, p1)
-    d2 = _cross(q1, q2, p2)
-    d3 = _cross(p1, p2, q1)
-    d4 = _cross(p1, p2, q2)
+    d1, d2, d3, d4 = (
+        _require_finite_result(d, what="cross product")
+        for d in (_cross(q1, q2, p1), _cross(q1, q2, p2), _cross(p1, p2, q1), _cross(p1, p2, q2))
+    )
     if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)) and 0 not in (d1, d2, d3, d4):
         return True
 
@@ -100,6 +114,8 @@ def validate_footprint(footprint: Sequence[Sequence[float]]) -> list[Point]:
     - non-zero area;
     - simple (no self-intersections) and convex. Collinear vertices are
       allowed. Either winding direction is accepted.
+    - the area and cross products used for these checks must themselves be
+      finite (no floating-point overflow), otherwise they cannot be trusted.
 
     Returns:
         A new list of (float, float) tuples, same order as the input.
@@ -132,13 +148,15 @@ def validate_footprint(footprint: Sequence[Sequence[float]]) -> list[Point]:
                 "consecutive vertices must differ and the ring must not be explicitly closed."
             )
 
-    if signed_area(points) == 0.0:
+    if _require_finite_result(signed_area(points), what="area") == 0.0:
         raise FootprintError("footprint has zero area (all vertices collinear).")
 
     # Convexity: every turn must go the same way (collinear turns allowed).
     turn_sign = 0
     for i in range(n):
-        turn = _cross(points[i], points[(i + 1) % n], points[(i + 2) % n])
+        turn = _require_finite_result(
+            _cross(points[i], points[(i + 1) % n], points[(i + 2) % n]), what="cross product"
+        )
         if turn == 0.0:
             continue
         sign = 1 if turn > 0 else -1
@@ -191,7 +209,8 @@ def pad_footprint(footprint: Sequence[Sequence[float]], padding: float) -> list[
         winding direction as the input. `footprint` is never mutated.
 
     Raises:
-        FootprintError: if `footprint` or `padding` is invalid.
+        FootprintError: if `footprint` or `padding` is invalid, or a padded
+            vertex overflows to a non-finite value.
     """
     points = validate_footprint(footprint)
     padding = validate_padding(padding)
@@ -225,4 +244,7 @@ def pad_footprint(footprint: Sequence[Sequence[float]], padding: float) -> list[
         x, y = points[i]
         padded.append((x + scale * (n1[0] + n2[0]), y + scale * (n1[1] + n2[1])))
 
+    for x, y in padded:
+        _require_finite_result(x, what="padded vertex x")
+        _require_finite_result(y, what="padded vertex y")
     return padded

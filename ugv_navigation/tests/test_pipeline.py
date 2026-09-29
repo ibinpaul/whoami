@@ -245,6 +245,98 @@ def test_inconsistent_hazard_and_lethal_cost_is_rejected(cost_values, geometry_c
             )
 
 
+
+# --- Geometry audit regressions -----------------------------------------------
+
+
+def test_geometry_lethal_survives_inflation():
+    classes, occupied = build_scenario()
+    result = run_costmap_pipeline(make_inputs(classes, occupied), inflation_radius=INFLATION_RADIUS)
+    assert (result.geometry[occupied] == LETHAL_COST).all()
+    assert (result.fused[occupied] == LETHAL_COST).all()
+    assert (result.final[occupied] == LETHAL_COST).all()
+
+
+@pytest.mark.parametrize("semantic_class", [TRAVERSABLE, UNKNOWN, HAZARD])
+def test_all_occupied_geometry_is_all_lethal_for_any_semantic_input(semantic_class):
+    classes = np.full((SIZE, SIZE), semantic_class, dtype=np.uint8)
+    occupied = np.ones((SIZE, SIZE), dtype=bool)
+    result = run_costmap_pipeline(make_inputs(classes, occupied), inflation_radius=0.0)
+    assert (result.final == LETHAL_COST).all()
+
+
+def test_free_geometry_does_not_clear_semantic_hazard_or_unknown():
+    classes, _ = build_scenario()
+    free = np.zeros((SIZE, SIZE), dtype=bool)
+    without = run_costmap_pipeline(make_inputs(classes), inflation_radius=0.0)
+    result = run_costmap_pipeline(make_inputs(classes, free), inflation_radius=0.0)
+    np.testing.assert_array_equal(result.fused, without.fused)
+    assert (result.fused == LETHAL_COST).any() and (result.fused == UNKNOWN_COST).any()
+
+
+def test_geometry_absent_gives_none_and_fused_is_semantic():
+    classes, _ = build_scenario()
+    result = run_costmap_pipeline(make_inputs(classes), inflation_radius=0.0)
+    assert result.geometry is None
+    assert result.fused is result.semantic
+
+
+def test_pipeline_does_not_mutate_occupancy_source():
+    classes, occupied = build_scenario()
+    before = occupied.copy()
+    inputs = make_inputs(classes, occupied)
+    occupied[0, 0] = True  # mutate the source after the input was built
+    result = run_costmap_pipeline(inputs, inflation_radius=0.0)
+    assert not inputs.occupancy.occupied[0, 0]
+    assert result.geometry[0, 0] == FREE_COST
+    occupied[0, 0] = before[0, 0]
+    np.testing.assert_array_equal(occupied, before)
+
+
+def test_occupancy_stamp_is_not_compared_with_mask_stamp():
+    """No geometry stamp policy exists yet (PENDING): the core does not invent one."""
+    classes, occupied = build_scenario()
+    inputs = CostmapCoreInputs(
+        mask=SemanticMaskInput(classes=classes, stamp_ns=STAMP, frame_id=CAM, valid=True),
+        intrinsics=CameraIntrinsicsInput(
+            intrinsics=INTRINSICS, image_width=SIZE, image_height=SIZE, frame_id=CAM
+        ),
+        camera_ground=CameraGroundInput(
+            geometry=DOWNWARD_CAMERA, camera_frame_id=CAM, ground_frame_id=GROUND, stamp_ns=STAMP
+        ),
+        grid=GridInput(geometry=GRID, frame_id=GROUND),
+        occupancy=OccupancyInput(occupied=occupied, stamp_ns=STAMP * 50, frame_id=GROUND),
+    )
+    assert (run_costmap_pipeline(inputs, inflation_radius=0.0).final[occupied] == LETHAL_COST).all()
+
+
+# --- Cost value validation through the pipeline ---------------------------------
+
+
+@pytest.mark.parametrize("lethal, traversable, unknown, free", [(200, 10, 128, 5), (253, 0, 255, 0)])
+def test_valid_custom_costs_keep_geometry_precedence(lethal, traversable, unknown, free):
+    classes, occupied = build_scenario()
+    result = run_costmap_pipeline(
+        make_inputs(classes, occupied),
+        inflation_radius=INFLATION_RADIUS,
+        cost_values=CostValues(unknown_cost=unknown, traversable_cost=traversable, hazard_cost=lethal),
+        geometry_cost_values=GeometryCostValues(lethal_cost=lethal, free_cost=free),
+    )
+    assert (result.final[occupied] == lethal).all()
+    assert (result.fused[~occupied] == result.semantic[~occupied]).all()
+    assert (result.final <= max(lethal, unknown)).all()
+
+
+def test_pipeline_still_requires_hazard_equal_to_geometry_lethal():
+    classes, _ = build_scenario()
+    with pytest.raises(PipelineError, match="must equal"):
+        run_costmap_pipeline(
+            make_inputs(classes),
+            inflation_radius=0.0,
+            cost_values=CostValues(hazard_cost=250),
+            geometry_cost_values=GeometryCostValues(lethal_cost=251),
+        )
+
 # --- Footprint -----------------------------------------------------------------
 
 
@@ -283,6 +375,57 @@ def test_padding_without_footprint_is_rejected():
 
 @pytest.mark.parametrize("padding", [-0.1, float("nan"), True])
 def test_invalid_footprint_padding_is_rejected(padding):
+    classes, _ = build_scenario()
+    with pytest.raises(FootprintError):
+        run_costmap_pipeline(
+            make_inputs(classes, footprint=SYNTHETIC_FOOTPRINT),
+            inflation_radius=0.0,
+            footprint_padding=padding,
+        )
+
+
+
+def test_padded_footprint_does_not_change_any_costmap_stage():
+    """The footprint is carried through, never rasterised: no costmap cell depends on it."""
+    classes, occupied = build_scenario()
+    without = run_costmap_pipeline(make_inputs(classes, occupied), inflation_radius=INFLATION_RADIUS)
+    result = run_costmap_pipeline(
+        make_inputs(classes, occupied, footprint=SYNTHETIC_FOOTPRINT),
+        inflation_radius=INFLATION_RADIUS,
+        footprint_padding=0.5,
+    )
+    for stage in ("semantic", "geometry", "fused", "final"):
+        assert np.array_equal(getattr(result, stage), getattr(without, stage)), stage
+
+
+def test_footprint_frame_is_not_checked_against_other_frames():
+    """No base frame is in the contract yet, so the footprint frame is stored only."""
+    classes, _ = build_scenario()
+    inputs = make_inputs(classes, footprint=SYNTHETIC_FOOTPRINT)
+    assert inputs.footprint.frame_id == ROBOT
+    assert ROBOT not in (inputs.grid.frame_id, inputs.mask.frame_id)
+    assert run_costmap_pipeline(inputs, inflation_radius=0.0).footprint == SYNTHETIC_FOOTPRINT
+
+
+def test_padding_leaves_input_footprint_unchanged():
+    classes, _ = build_scenario()
+    inputs = make_inputs(classes, footprint=SYNTHETIC_FOOTPRINT)
+    before = inputs.footprint.vertices
+    result = run_costmap_pipeline(inputs, inflation_radius=0.0, footprint_padding=0.05)
+    assert inputs.footprint.vertices == before == SYNTHETIC_FOOTPRINT
+    assert result.footprint != before
+
+
+def test_zero_padding_returns_footprint_unchanged():
+    classes, _ = build_scenario()
+    result = run_costmap_pipeline(
+        make_inputs(classes, footprint=SYNTHETIC_FOOTPRINT), inflation_radius=0.0, footprint_padding=0.0
+    )
+    assert result.footprint == SYNTHETIC_FOOTPRINT
+
+
+@pytest.mark.parametrize("padding", [float("inf"), float("-inf"), "0.1", [0.1]])
+def test_more_invalid_footprint_padding_rejected(padding):
     classes, _ = build_scenario()
     with pytest.raises(FootprintError):
         run_costmap_pipeline(

@@ -84,6 +84,71 @@ class CameraGroundGeometry:
             raise ProjectionError(f"Invalid pitch_rad: {self.pitch_rad!r}. Must be finite.")
 
 
+# Numerical tolerance for pose validation: max |R^T R - I| entry, |det(R) - 1|
+# and | |q| - 1 |. Absorbs float64 round-off from upstream quaternion or matrix
+# arithmetic. It is not a real-world value.
+POSE_TOLERANCE = 1e-6
+
+
+def _finite_float_array(value: object, shape: tuple[int, ...], *, name: str) -> np.ndarray:
+    """Read-only float64 copy of `value`, or ProjectionError. Never coerces bools."""
+    array = np.asarray(value)
+    if array.dtype.kind not in "iuf":
+        raise ProjectionError(f"{name} must be a real numeric array, got dtype {array.dtype}")
+    if array.shape != shape:
+        raise ProjectionError(f"{name} must have shape {shape}, got {array.shape}")
+    array = np.array(array, dtype=np.float64, copy=True)
+    if not np.all(np.isfinite(array)):
+        raise ProjectionError(f"{name} must be finite, got {array.tolist()}")
+    array.setflags(write=False)
+    return array
+
+
+@dataclass(frozen=True, eq=False)
+class CameraPose:
+    """Rigid 6-DoF pose of the camera optical frame in the ground/costmap frame.
+
+    rotation: 3x3 matrix taking a direction in the camera optical frame
+        (x-right, y-down, z-forward) to the same direction in the ground
+        frame. Must be orthonormal with det = +1, within POSE_TOLERANCE.
+    translation: camera optical centre in the ground frame, (x, y, z).
+
+    This is the transform a TF lookup (target = ground frame, source = camera
+    optical frame) returns. The ground is the z = 0 plane of the ground
+    frame (flat-ground model), so translation z must be > 0: the camera must
+    be above the ground, as with CameraGroundGeometry.camera_height > 0.
+
+    Both arrays are stored as read-only float64 copies. No defaults.
+    """
+
+    rotation: np.ndarray
+    translation: np.ndarray
+
+    def __post_init__(self) -> None:
+        rotation = _finite_float_array(self.rotation, (3, 3), name="rotation")
+        translation = _finite_float_array(self.translation, (3,), name="translation")
+
+        orthonormal_error = float(np.max(np.abs(rotation.T @ rotation - np.eye(3))))
+        if orthonormal_error > POSE_TOLERANCE:
+            raise ProjectionError(
+                f"rotation is not orthonormal: max |R^T R - I| = {orthonormal_error!r} "
+                f"> {POSE_TOLERANCE}"
+            )
+        det = float(np.linalg.det(rotation))
+        if abs(det - 1.0) > POSE_TOLERANCE:
+            raise ProjectionError(
+                f"rotation determinant must be +1 (a proper rotation), got {det!r}"
+            )
+        if not translation[2] > 0.0:
+            raise ProjectionError(
+                f"translation z must be > 0 (camera above the ground plane), "
+                f"got {float(translation[2])!r}"
+            )
+
+        object.__setattr__(self, "rotation", rotation)
+        object.__setattr__(self, "translation", translation)
+
+
 @dataclass(frozen=True)
 class GroundPoint:
     """A point on the ground plane (z=0 implicit), in the world frame."""
@@ -112,6 +177,83 @@ _OPTICAL_TO_LEVEL_WORLD = np.array(
 _MIN_DOWNWARD_Z_COMPONENT = 1e-9
 
 
+def _pitch_rotation(pitch: float) -> np.ndarray:
+    """Rotation about the world y axis by `pitch` (positive = nose down)."""
+    return np.array(
+        [
+            [math.cos(pitch), 0.0, math.sin(pitch)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(pitch), 0.0, math.cos(pitch)],
+        ]
+    )
+
+
+def _require_real(value: object, *, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ProjectionError(f"{name} must be a real number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ProjectionError(f"{name} must be finite, got {value!r}")
+    return value
+
+
+def camera_pose_from_quaternion(
+    *, qx: float, qy: float, qz: float, qw: float, tx: float, ty: float, tz: float
+) -> CameraPose:
+    """Build a CameraPose from a rotation quaternion and a translation.
+
+    The quaternion is (x, y, z, w), Hamilton convention, the same order and
+    meaning as a ROS geometry_msgs/Quaternion (no ROS types are used here).
+    Its norm must be 1 within POSE_TOLERANCE; it is then normalised so the
+    rotation matrix is orthonormal to float64 precision. q and -q give the
+    same rotation. Keyword-only, so x/y/z/w order cannot be mixed up.
+
+    Raises ProjectionError for non-real, non-finite or non-unit quaternions
+    and for an invalid translation (see CameraPose).
+    """
+    q = np.array(
+        [
+            _require_real(qx, name="qx"),
+            _require_real(qy, name="qy"),
+            _require_real(qz, name="qz"),
+            _require_real(qw, name="qw"),
+        ]
+    )
+    norm = float(np.linalg.norm(q))
+    if abs(norm - 1.0) > POSE_TOLERANCE:
+        raise ProjectionError(f"quaternion must have unit norm, got |q| = {norm!r}")
+    x, y, z, w = q / norm
+    rotation = np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    )
+    translation = [
+        _require_real(tx, name="tx"),
+        _require_real(ty, name="ty"),
+        _require_real(tz, name="tz"),
+    ]
+    return CameraPose(rotation=rotation, translation=translation)
+
+
+def camera_ground_geometry_to_pose(geometry: CameraGroundGeometry) -> CameraPose:
+    """The CameraPose equivalent to a height + pitch CameraGroundGeometry.
+
+    rotation = R_y(pitch) @ optical-to-level-world axis change,
+    translation = (0, 0, camera_height).
+    """
+    if not isinstance(geometry, CameraGroundGeometry):
+        raise TypeError(
+            f"geometry must be a CameraGroundGeometry, got {type(geometry).__name__}"
+        )
+    return CameraPose(
+        rotation=_pitch_rotation(geometry.pitch_rad) @ _OPTICAL_TO_LEVEL_WORLD,
+        translation=[0.0, 0.0, geometry.camera_height],
+    )
+
+
 def pixel_to_camera_ray(u: float, v: float, intrinsics: CameraIntrinsics) -> np.ndarray:
     """Convert a pixel coordinate into a 3D ray direction in the camera's
     optical frame (x-right, y-down, z-forward). The returned vector is not
@@ -127,33 +269,47 @@ def pixel_to_camera_ray(u: float, v: float, intrinsics: CameraIntrinsics) -> np.
     return np.array([x_cam, y_cam, 1.0])
 
 
-def camera_ray_to_ground_point(
-    ray_camera: np.ndarray, geometry: CameraGroundGeometry
-) -> GroundPoint:
-    """Intersect a camera-frame ray with the ground plane.
-
-    The ray is transformed into the world frame using `geometry`'s pitch,
-    then intersected with the z=0 plane.
-
-    Raises ProjectionError if the world-frame ray does not point downward
-    (i.e. it is parallel to, or diverges away from, the ground plane).
-    """
-    pitch = geometry.pitch_rad
-    rot_pitch = np.array(
-        [
-            [math.cos(pitch), 0.0, math.sin(pitch)],
-            [0.0, 1.0, 0.0],
-            [-math.sin(pitch), 0.0, math.cos(pitch)],
-        ]
-    )
-    world_dir = rot_pitch @ (_OPTICAL_TO_LEVEL_WORLD @ ray_camera)
-
+def _require_downward(world_dir: np.ndarray) -> None:
     if world_dir[2] >= -_MIN_DOWNWARD_Z_COMPONENT:
         raise ProjectionError(
             "Camera ray does not intersect the ground plane: world-frame "
             f"downward component is {world_dir[2]!r} (must be < 0). The ray "
             "is parallel to or diverging away from the ground."
         )
+
+
+def camera_ray_to_ground_point(
+    ray_camera: np.ndarray, geometry: CameraGroundGeometry | CameraPose
+) -> GroundPoint:
+    """Intersect a camera-frame ray with the ground plane (z = 0).
+
+    CameraGroundGeometry: the ray is rotated by the pitch; the camera is at
+    (0, 0, camera_height). This path is kept exactly as before.
+    CameraPose: the ray is rotated by `rotation`; the camera is at
+    `translation`, so the ground point includes the camera's x/y offset.
+
+    Raises ProjectionError if the world-frame ray does not point downward
+    (i.e. it is parallel to, or diverges away from, the ground plane), and
+    TypeError for any other geometry type -- never ProjectionError, so a
+    wrong type is not mistaken for a per-pixel miss.
+    """
+    if isinstance(geometry, CameraPose):
+        world_dir = geometry.rotation @ ray_camera
+        _require_downward(world_dir)
+        origin = geometry.translation
+        t = -origin[2] / world_dir[2]
+        return GroundPoint(
+            x=float(origin[0] + t * world_dir[0]),
+            y=float(origin[1] + t * world_dir[1]),
+        )
+    if not isinstance(geometry, CameraGroundGeometry):
+        raise TypeError(
+            "geometry must be a CameraGroundGeometry or CameraPose, "
+            f"got {type(geometry).__name__}"
+        )
+
+    world_dir = _pitch_rotation(geometry.pitch_rad) @ (_OPTICAL_TO_LEVEL_WORLD @ ray_camera)
+    _require_downward(world_dir)
 
     t = -geometry.camera_height / world_dir[2]
     ground_x = t * world_dir[0]
@@ -162,7 +318,7 @@ def camera_ray_to_ground_point(
 
 
 def project_pixel_to_ground(
-    u: float, v: float, intrinsics: CameraIntrinsics, geometry: CameraGroundGeometry
+    u: float, v: float, intrinsics: CameraIntrinsics, geometry: CameraGroundGeometry | CameraPose
 ) -> GroundPoint:
     """Project a single pixel to a ground-plane point.
 

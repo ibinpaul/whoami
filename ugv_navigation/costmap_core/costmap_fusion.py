@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from costmap_core.class_to_cost import require_cost
+
 # Matches class_to_cost.CostValues.hazard_cost and
 # geometry_costmap.GeometryCostValues.lethal_cost by default.
 DEFAULT_LETHAL_COST = 254
@@ -61,9 +63,12 @@ def fuse_costmaps(
         is mutated or returned by reference.
 
     Raises:
-        CostmapFusionError: if either input is not 2D, or the two inputs
-            do not have identical shapes.
+        CostmapFusionError: if `lethal_cost` is not an integer cost in
+            0..255, if either input is not 2D, the two inputs
+            do not have identical shapes, or either is not an integer
+            (non-bool) cost array.
     """
+    lethal_cost = require_cost(lethal_cost, name="lethal_cost", error=CostmapFusionError)
     semantic = np.asarray(semantic_costmap)
     geometry = np.asarray(geometry_costmap)
 
@@ -82,5 +87,14 @@ def fuse_costmaps(
             f"semantic_costmap shape {semantic.shape} does not match "
             f"geometry_costmap shape {geometry.shape}."
         )
+    # Costs are integers. A bool occupancy mask passed as geometry_costmap
+    # would compare unequal to lethal_cost everywhere and silently drop every
+    # obstacle, so anything but a (non-bool) integer array is rejected.
+    for name, array in (("semantic_costmap", semantic), ("geometry_costmap", geometry)):
+        if array.dtype == np.bool_ or not np.issubdtype(array.dtype, np.integer):
+            raise CostmapFusionError(
+                f"{name} must be an integer cost array, got dtype={array.dtype!r}. "
+                "Convert occupancy with geometry_costmap.build_geometry_costmap first."
+            )
 
     return np.where(geometry == lethal_cost, lethal_cost, semantic)

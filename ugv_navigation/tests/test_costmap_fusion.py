@@ -129,3 +129,110 @@ def test_custom_lethal_cost_is_respected():
     geometry = np.array([[200, 100]])
     result = fuse_costmaps(semantic, geometry, lethal_cost=200)
     assert result.tolist() == [[200, TRAVERSABLE]]
+
+
+# --- audit regressions ------------------------------------------------------
+
+
+def test_bool_occupancy_passed_as_geometry_costmap_is_rejected():
+    """A raw occupancy mask is not a cost array: it would compare unequal to
+    lethal everywhere and silently drop every obstacle."""
+    semantic = np.full((2, 2), TRAVERSABLE, dtype=np.int64)
+    occupied = np.array([[True, False], [False, True]])
+    with pytest.raises(CostmapFusionError, match="geometry_costmap must be an integer"):
+        fuse_costmaps(semantic, occupied)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        np.zeros((2, 2), dtype=bool),
+        np.zeros((2, 2), dtype=np.float64),
+        np.array([[np.nan, LETHAL], [FREE, FREE]]),
+        np.array([["a", "b"], ["c", "d"]]),
+        np.array([[None, None], [None, None]], dtype=object),
+    ],
+    ids=["bool", "float", "float_nan", "str", "object"],
+)
+@pytest.mark.parametrize("side", ["semantic", "geometry"])
+def test_non_integer_cost_arrays_rejected(bad, side):
+    good = np.zeros((2, 2), dtype=np.int64)
+    args = (bad, good) if side == "semantic" else (good, bad)
+    with pytest.raises(CostmapFusionError, match=f"{side}_costmap must be an integer"):
+        fuse_costmaps(*args)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.int16, np.int32, np.int64, np.uint16])
+def test_integer_dtypes_accepted(dtype):
+    semantic = np.array([[TRAVERSABLE, UNKNOWN]], dtype=dtype)
+    geometry = np.array([[LETHAL, LETHAL]], dtype=dtype)
+    assert fuse_costmaps(semantic, geometry).tolist() == [[LETHAL, LETHAL]]
+
+
+def test_every_semantic_cost_against_every_geometry_kind():
+    """Exhaustive: semantic 0..255 x geometry {free, intermediate, lethal}."""
+    semantic_values = np.arange(256, dtype=np.int64)
+    for geometry_value in (FREE, 1, 128, 253, LETHAL):
+        semantic = semantic_values.reshape(16, 16)
+        geometry = np.full((16, 16), geometry_value, dtype=np.int64)
+        fused = fuse_costmaps(semantic, geometry)
+        if geometry_value == LETHAL:
+            assert (fused == LETHAL).all()
+        else:
+            # Only geometry *lethal* overrides; anything else leaves semantics intact.
+            np.testing.assert_array_equal(fused, semantic)
+
+
+def test_random_grids_obey_geometry_lethal_precedence():
+    rng = np.random.default_rng(1234)
+    semantic_choices = np.array([TRAVERSABLE, HAZARD, UNKNOWN])
+    for _ in range(50):
+        shape = tuple(rng.integers(1, 12, size=2))
+        semantic = rng.choice(semantic_choices, size=shape).astype(np.int64)
+        occupied = rng.random(shape) < 0.3
+        geometry = np.where(occupied, LETHAL, FREE).astype(np.int64)
+        fused = fuse_costmaps(semantic, geometry)
+        # Geometry lethal cells are lethal whatever the semantic class.
+        assert (fused[occupied] == LETHAL).all()
+        # Elsewhere the semantic cost is unchanged: free geometry clears nothing,
+        # semantic hazard stays lethal and semantic unknown stays unknown.
+        np.testing.assert_array_equal(fused[~occupied], semantic[~occupied])
+        # Output only contains semantic values and lethal.
+        assert set(np.unique(fused)) <= set(np.unique(semantic)) | {LETHAL}
+
+
+def test_free_geometry_never_clears_semantic_lethal_or_unknown():
+    semantic = np.array([[HAZARD, UNKNOWN], [UNKNOWN, HAZARD]], dtype=np.int64)
+    geometry = np.full((2, 2), FREE, dtype=np.int64)
+    np.testing.assert_array_equal(fuse_costmaps(semantic, geometry), semantic)
+
+
+def test_rejected_inputs_are_not_mutated():
+    semantic = np.full((2, 2), UNKNOWN, dtype=np.int64)
+    occupied = np.array([[True, False], [False, True]])
+    before_s, before_o = semantic.copy(), occupied.copy()
+    with pytest.raises(CostmapFusionError):
+        fuse_costmaps(semantic, occupied)
+    np.testing.assert_array_equal(semantic, before_s)
+    np.testing.assert_array_equal(occupied, before_o)
+
+
+@pytest.mark.parametrize("bad", [True, 254.0, -1, 256, "254", None])
+def test_invalid_fusion_lethal_cost_rejected(bad):
+    semantic = np.zeros((1, 1), dtype=np.int64)
+    with pytest.raises(CostmapFusionError, match="lethal_cost"):
+        fuse_costmaps(semantic, semantic, lethal_cost=bad)
+
+
+def test_bool_lethal_cost_cannot_match_occupancy_like_ones():
+    """lethal_cost=True used to compare equal to geometry cost 1."""
+    semantic = np.zeros((1, 2), dtype=np.int64)
+    geometry = np.array([[1, 0]], dtype=np.int64)
+    with pytest.raises(CostmapFusionError):
+        fuse_costmaps(semantic, geometry, lethal_cost=True)
+
+
+def test_numpy_integer_lethal_cost_accepted():
+    semantic = np.array([[TRAVERSABLE]], dtype=np.int64)
+    geometry = np.array([[LETHAL]], dtype=np.int64)
+    assert fuse_costmaps(semantic, geometry, lethal_cost=np.int64(LETHAL)).tolist() == [[LETHAL]]

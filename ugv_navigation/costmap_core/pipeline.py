@@ -18,6 +18,10 @@ of the underlying modules.
 
 No real-world value has a default: `inflation_radius` must be supplied,
 and footprint padding is only applied when explicitly given.
+
+`point_cloud_to_occupancy` wires the geometry side-channel stages the same
+way (transform -> obstacle filter -> rasterise) into the optional
+`CostmapCoreInputs.occupancy`.
 """
 
 from __future__ import annotations
@@ -28,7 +32,13 @@ from typing import Optional
 import numpy as np
 
 from costmap_core.class_to_cost import DEFAULT_COST_VALUES, CostValues
-from costmap_core.contracts import CostmapCoreInputs
+from costmap_core.contracts import (
+    CameraGroundInput,
+    CostmapCoreInputs,
+    GridInput,
+    OccupancyInput,
+    PointCloudInput,
+)
 from costmap_core.costmap_fusion import fuse_costmaps
 from costmap_core.footprint import Point, pad_footprint
 from costmap_core.geometry_costmap import (
@@ -38,6 +48,9 @@ from costmap_core.geometry_costmap import (
 )
 from costmap_core.inflation import inflate_costmap
 from costmap_core.mask_projection import project_mask_to_costmap
+from costmap_core.point_cloud_filter import ObstacleFilterParams, filter_obstacle_points
+from costmap_core.point_cloud_raster import rasterize_obstacle_points
+from costmap_core.point_cloud_transform import transform_point_cloud
 
 
 class PipelineError(ValueError):
@@ -63,7 +76,8 @@ class CostmapPipelineResult:
     geometry: geometry costmap, or None when no occupancy was supplied.
     fused: semantic after geometry precedence; the same array as `semantic`
         when no occupancy was supplied (there is nothing to fuse).
-    final: `fused` after inflation. This is the costmap to publish.
+    final: `fused` after Dev 3 inflation. Not what costmap_ros publishes:
+        the node publishes `fused` (non-inflated); obstacle inflation is Nav2's.
     footprint: the input footprint (padded if padding was given), or None
         when no footprint was supplied. It is in the footprint's own robot
         frame and is NOT applied to any costmap cell.
@@ -165,3 +179,25 @@ def run_costmap_pipeline(
         final=final,
         footprint=footprint,
     )
+
+
+def point_cloud_to_occupancy(
+    cloud: PointCloudInput,
+    camera_ground: CameraGroundInput,
+    grid: GridInput,
+    filter_params: ObstacleFilterParams,
+) -> OccupancyInput:
+    """One geometry observation -> OccupancyInput on `grid`.
+
+        cloud (camera optical frame)
+            -> ground frame            (point_cloud_transform.transform_point_cloud)
+            -> obstacle candidates     (point_cloud_filter.filter_obstacle_points)
+            -> occupied cells          (point_cloud_raster.rasterize_obstacle_points)
+
+    camera_ground is the pose of cloud.frame_id in grid.frame_id at the
+    cloud's stamp. The result keeps cloud.stamp_ns. False cells mean "no
+    obstacle evidence", never free space. Stage errors propagate unchanged.
+    """
+    in_ground = transform_point_cloud(cloud, camera_ground)
+    obstacles = filter_obstacle_points(in_ground, camera_ground, filter_params)
+    return rasterize_obstacle_points(obstacles, grid)

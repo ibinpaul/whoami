@@ -208,3 +208,115 @@ def test_input_footprint_is_not_mutated():
     rect_snapshot = list(SYNTHETIC_RECTANGLE_CCW)
     pad_footprint(SYNTHETIC_RECTANGLE_CCW, 0.2)
     assert SYNTHETIC_RECTANGLE_CCW == rect_snapshot
+
+
+# --- audit: malformed input, duplicates, overflow ----------------------------
+
+
+@pytest.mark.parametrize(
+    "footprint",
+    [
+        [(0, 0), (1, 0), {0: 0, 1: 1}],  # vertex is a mapping, not a pair
+        [(0, 0), (1, 0), (1,)],  # vertex too short
+        [(0, 0), (1, 0), "01"],  # vertex is a string of length 2
+        [(0, 0), (1, 0), ((0, 1),)],  # nested pair
+        ((x, y) for x, y in SYNTHETIC_TRIANGLE),  # generator, not a sequence
+        {(0, 0), (1, 0), (0, 1)},  # set: unordered
+    ],
+)
+def test_malformed_points_rejected(footprint):
+    with pytest.raises(FootprintError):
+        validate_footprint(footprint)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_non_finite_coordinate_rejected_on_either_axis(axis, bad):
+    footprint = [list(p) for p in SYNTHETIC_TRIANGLE]
+    footprint[1][axis] = bad
+    with pytest.raises(FootprintError, match="finite"):
+        validate_footprint(footprint)
+
+
+def test_non_consecutive_duplicate_vertex_rejected():
+    # Revisiting vertex (0, 0) mid-ring cannot form a simple convex polygon.
+    with pytest.raises(FootprintError):
+        validate_footprint([(0, 0), (2, 0), (2, 2), (0, 0), (0, 2)])
+
+
+@pytest.mark.parametrize(
+    "footprint",
+    [
+        [(0, 0), (2, 0), (4, 0), (2, 0), (2, 2), (0, 2)],  # spike out and back along an edge
+        [(0, 0), (3, 0), (1, 0), (1, 1), (0, 1)],  # edge doubles back over itself
+    ],
+)
+def test_degenerate_spikes_rejected(footprint):
+    with pytest.raises(FootprintError):
+        validate_footprint(footprint)
+
+
+def test_double_wound_polygon_rejected():
+    triangle = [(1.0, 0.0), (-0.5, 0.8660254), (-0.5, -0.8660254)]  # test-only
+    with pytest.raises(FootprintError, match="self-intersecting"):
+        validate_footprint(triangle * 2)
+
+
+def test_collinear_points_that_overflow_area_are_rejected():
+    # Finite coordinates, but x0*y1 overflows to inf and inf - inf = nan,
+    # which used to slip past the zero-area and convexity checks.
+    with pytest.raises(FootprintError, match="not finite"):
+        validate_footprint([(0.0, 0.0), (1e160, 1e160), (2e160, 2e160)])
+
+
+def test_large_but_representable_footprint_still_accepted():
+    """No magnitude limit is invented: only overflowing arithmetic is refused."""
+    s = 1e100  # test-only scale, far beyond any robot
+    assert validate_footprint([(s, s), (-s, s), (-s, -s), (s, -s)])[0] == (s, s)
+
+
+def test_padding_that_overflows_is_rejected():
+    with pytest.raises(FootprintError, match="padded vertex"):
+        pad_footprint(SYNTHETIC_TRIANGLE, 1e308)
+
+
+def test_negative_zero_padding_is_zero():
+    assert pad_footprint(SYNTHETIC_RECTANGLE_CCW, -0.0) == validate_footprint(SYNTHETIC_RECTANGLE_CCW)
+
+
+@pytest.mark.parametrize("padding", [math.nan, math.inf, -math.inf])
+def test_non_finite_padding_rejected_by_pad_footprint(padding):
+    with pytest.raises(FootprintError, match="finite"):
+        pad_footprint(SYNTHETIC_RECTANGLE_CCW, padding)
+
+
+def test_validate_returns_new_list_each_call():
+    a = validate_footprint(SYNTHETIC_RECTANGLE_CCW)
+    b = validate_footprint(SYNTHETIC_RECTANGLE_CCW)
+    assert a == b and a is not b
+    a.append((9.0, 9.0))
+    assert validate_footprint(SYNTHETIC_RECTANGLE_CCW) == b
+
+
+# --- audit: Python ints beyond float range, determinism ----------------------
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_int_coordinate_beyond_float_range_is_footprint_error(axis):
+    vertex = [0, 1]
+    vertex[axis] = 10 ** 400  # float(10**400) raises OverflowError
+    with pytest.raises(FootprintError, match="too large"):
+        validate_footprint([(0, 0), tuple(vertex), (1, 1)])
+
+
+def test_int_padding_beyond_float_range_is_footprint_error():
+    with pytest.raises(FootprintError, match="too large"):
+        pad_footprint([(0, 0), (1, 0), (1, 1), (0, 1)], 10 ** 400)
+
+
+def test_padding_is_deterministic_and_returns_fresh_lists():
+    square = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+    a = pad_footprint(square, 0.1)
+    b = pad_footprint(square, 0.1)
+    assert a == b and a is not b
+    assert a == [(-0.6, -0.6), (0.6, -0.6), (0.6, 0.6), (-0.6, 0.6)]

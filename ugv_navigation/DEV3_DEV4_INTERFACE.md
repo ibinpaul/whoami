@@ -1,270 +1,177 @@
-# Dev 3 → Dev 4 interface (pre-ROS hand-off)
+# Dev 3 → downstream (Dev 4 / Nav2) output contract
 
-Status as of this document: Dev 3 algorithms are implemented and tested with
-synthetic inputs. **ROS/Nav2 integration is not done.** Nothing here freezes
-the final ROS interface.
+What the Dev 3 costmap node (`costmap_ros/costmap_node.py`) publishes today,
+stated precisely enough for a consumer to depend on. Every statement below is
+implemented and covered by tests in `ugv_navigation/tests/` (1673 passing at
+the time of writing). Values marked **PENDING** are not defined by any project
+document and have **no default** in code: the node refuses to start without
+them.
 
-Sources: `PROJECT_CONTEXT.md` (**PC**), `dev.md` (**DEV**), `architecture.md`
-(**ARCH**), Dev 1 code under `whoami/turing/src/ugv_perception/` (**D1**,
-read-only), Dev 3 code under `ugv_navigation/costmap_core/`, and
-[`costmap_core/INTEGRATION_CHECKLIST.md`](costmap_core/INTEGRATION_CHECKLIST.md)
-(**CHECKLIST**). No Dev 2 source code exists in this workspace; Dev 2 facts
-come only from the documents above.
+This is the output of a standalone ROS 2 node. **Nav2 integration is not
+done**; how this output enters a Nav2 costmap (StaticLayer, a custom layer, or
+Nav2 layers replacing parts of Dev 3) is a team decision (see §10).
 
-Labels: **CONFIRMED** (in project docs or code) · **INTENDED** (documented
-target, not implemented) · **IMPLEMENTED** (Dev 3 code, tested) ·
-**PENDING / TBD** (not defined yet).
+Sources: `architecture.md` (**ARCH**), `dev.md` (**DEV**), Dev 3 code.
 
 ---
 
-## 1. Purpose
+## 1. Message, topic, QoS
 
-Defines the current Dev 3 → Dev 4 hand-off so Dev 4 can start planner and
-controller development against synthetic costmaps before live ROS integration.
-
-```
-Perception (Dev 1) → Dev 3 costmap → Dev 4 planner/controller
-```
-
-## 2. Dev 3 responsibility
-
-Per PC §3 and DEV §4 (Dev 3), Dev 3 owns the costmap subsystem in
-`ugv_navigation/` and costmap parameters in `config/robots/`:
-
-- semantic costmap processing (class → cost)
-- spatial projection (camera pixel → ground → grid)
-- geometry / semantic cost fusion
-- geometry lethal precedence ("geometry lethal always wins")
-- inflation (and footprint padding)
-- the costmap pipeline
-- eventually, the global and local costmap outputs
-
-Dev 4 also works in `ugv_navigation/` (Autonomy & Motion Core) and
-`config/robots/` (planner/controller params) per DEV §1/§4.
-
-## 3. Intended Dev 3 → Dev 4 interface (INTENDED)
-
-| Costmap | Topic | Type | Publisher | Subscriber |
-|---|---|---|---|---|
-| Global | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid` | Dev 3 | Dev 4 |
-| Local | `/local_costmap/costmap` | `nav_msgs/msg/OccupancyGrid` | Dev 3 | Dev 4 |
-
-Source: DEV §3 interface table, PC §3/§4. Contract rule in DEV §3: "2D
-occupancy grid combining semantic layers and geometry precedence (§9)".
-
-**PENDING / TBD** (no source defines them):
-
-- frame names (PC §6 lists `map`, `base_link` only as *temporary* examples)
-- resolution, width/height, origin
-- update / publish frequency
-- global vs local extent
-- ROS publisher vs Nav2 costmap layer plugin architecture (ARCH §5 shows a
-  Nav2 costmap with a semantic layer + optional VoxelLayer; DEV Dev 3 task 1
-  says "Semantic Costmap Layer Plugin"; the concrete form is not decided)
-- conversion rules from Dev 3 internal costs to `OccupancyGrid` data
-
-## 4. Internal Dev 3 cost semantics (IMPLEMENTED)
-
-These are the values in Dev 3's internal numpy costmap
-(`class_to_cost.CostValues`, `geometry_costmap.GeometryCostValues`,
-`inflation.py`). Defaults follow Nav2 `costmap_2d` cost conventions and are
-overridable.
-
-| Value | Meaning | Produced by |
+| Item | Contract | Where |
 |---|---|---|
-| `0` | free / traversable | semantic class 1, or free geometry |
-| `1..253` | intermediate: inflated cost near a lethal cell | `inflation.inflate_costmap` (placeholder linear decay) |
-| `254` | lethal | semantic class 2 (hazard) or geometric occupancy |
-| `255` | unknown | semantic class 0, **and** any cell no mask pixel reached |
+| Type | `nav_msgs/msg/OccupancyGrid` | `occupancy_grid.occupancy_grid_from_costmap` |
+| Topic | ROS parameter `costmap_topic` (required, no default). DEV §3 names `/global_costmap/costmap` and `/local_costmap/costmap`; which one a given node instance publishes is a deployment choice. One node instance = one grid = one topic. | `costmap_node.PARAMETERS` |
+| Publisher QoS | depth 10, RELIABLE, VOLATILE (rclpy default). Not latched: a late subscriber receives the next publication, not the previous one. A TRANSIENT_LOCAL subscription cannot match it. | `CostmapNode.__init__` |
 
-Rules enforced in code:
+## 2. Frame and grid geometry
 
-- **Geometry lethal always wins** (ARCH §9, PC §3): a geometrically occupied
-  cell is `254` whatever the semantic class. Semantic traversable never
-  clears it.
-- Several pixels in one cell: HAZARD > UNKNOWN > TRAVERSABLE.
-- Unknown is never turned into free (ARCH §8.1: `unknown` = "never free").
-- Inflation never lowers a cost and never creates a new lethal cell.
-- Grid layout: `array[row, col]`, row = y, col = x, origin = lower-left corner
-  of cell (0, 0) (the `OccupancyGrid` origin convention).
+| Field | Contract |
+|---|---|
+| `header.frame_id` | ROS parameter `target_frame` (required). It is also the TF target for projection and the grid frame. Frame name **PENDING**. The frame must have z = 0 on the ground plane (flat-ground model; `CameraPose` rejects a camera at z ≤ 0). |
+| `info.resolution` | `grid.resolution` (m/cell, finite > 0) |
+| `info.width`, `info.height` | `grid.width` (columns, x), `grid.height` (rows, y), positive ints |
+| `info.origin` | position (`grid.origin_x`, `grid.origin_y`, 0), orientation identity (w = 1). It is the **min-x, min-y corner of cell (0, 0)**. |
+| `data` | row-major: index = `row * width + col`; row increases with +y, col with +x. Cell (row, col) covers x ∈ [origin_x + col·res, +res), y ∈ [origin_y + row·res, +res). |
+| Grid motion | **Fixed origin** in `target_frame`: the grid does not move with the robot (no rolling window). |
 
-**These are Dev 3 internal semantics, not the `OccupancyGrid` wire format.**
-No project source defines how they map onto `OccupancyGrid.data`.
-Mapping is **PENDING**.
+All grid values are **PENDING** (Dev 3 `config/robots/`, DEV §1). None has a default.
 
-## 5. Dev 1 input contract (CONFIRMED, context only)
+## 3. Cost semantics and encoding
 
-Dev 4 does not consume these directly. Verified against D1 code
-(`port/ids.py`, `node/wire.py`, `node/adapter_node.py`) and DEV §3.
+**The published costmap is NOT inflated.** It is
+`CostmapPipelineResult.fused`: semantic costs with geometry-lethal precedence
+applied. Obstacle inflation belongs to Nav2 downstream. Dev 3's own
+inflation (`inflation.py`, `CostmapPipelineResult.final`) still exists and is
+still computed, but it is not published.
 
-| Topic | Type | Content | Dev 3 use |
+Internal Dev 3 costs (Nav2 `costmap_2d` conventions) are translated with
+Nav2's own `Costmap2DPublisher` table (`occupancy_grid.COST_TO_OCCUPANCY`).
+Costs outside 0..255 are rejected, never clipped.
+
+| Internal cost | Meaning in Dev 3 | `OccupancyGrid.data` | In the published output |
 |---|---|---|---|
-| `/segmentation/mask` | `sensor_msgs/msg/Image`, `mono8` | classes `0` unknown, `1` traversable, `2` hazard; stamp = image time; `frame_id` = optical frame | main input |
-| `/segmentation/port_meta` | `std_msgs/Float64MultiArray` (until D1's `PortMeta.msg` is compiled) | `[valid, age, scale]`; v1 `scale = 1.0` | validity (core refuses `valid=False`) |
-| `/segmentation/camera_info` | `sensor_msgs/msg/CameraInfo` | D1 republishes the last received CameraInfo (driver owned by Dev 5) | intrinsics source; topic choice for Dev 3 PENDING |
-| `/segmentation/confidence` | `sensor_msgs/msg/Image`, `32FC1` | per-pixel `[0,1]` | not used |
-| `/ugv/perception_degraded` | `std_msgs/msg/Bool` | perception stale/degraded | subscriber is Dev 5, not Dev 3 |
+| 0 | free: semantic traversable, no geometry obstacle | 0 | yes |
+| 254 | lethal: semantic hazard, geometric obstacle, or fail-safe ROI | 100 | yes |
+| 255 | unknown: semantic unknown, or a cell no mask pixel reached | −1 | yes |
+| 1..252 | Dev 3 inflation | 1..98 (1 + 97·(cost − 1) // 251) | **no** |
+| 253 | Dev 3 inflation (see note) | 99 | **no** |
 
-## 6. Geometry input
+So the published `data` contains only **0, 100 and −1** (tested).
 
-Dev 3 abstraction: `contracts.OccupancyInput` (IMPLEMENTED).
+Rules the consumer can rely on (enforced in code and tests):
 
-- 2D boolean grid, same shape and frame as the costmap grid.
-- `True` = occupied → cell becomes lethal (`254`).
-- Geometry lethal always wins over semantic free/traversable.
-- Optional: without it the pipeline uses semantics only.
+- **Geometry lethal always wins** (ARCH §9): a geometrically occupied cell is
+  lethal whatever the semantic class; semantic traversable never clears it.
+- Several mask pixels in one cell: hazard > unknown > traversable.
+- **Unknown is never emitted as free** (ARCH §8.1, §8.6).
+- No Dev 3 inflation is applied to the published output; `inflation_radius`
+  does not change it (tested).
+- Missing, empty, stale or future-dated geometry never removes a lethal cell
+  and never turns a cell free.
 
-**The live geometry producer is not implemented or connected.** ARCH §6/§9
-describe an optional Depth Anything → VoxelLayer side-channel; Dev 1 lists
-Depth Anything as task T08, deferred. Its topic, units, frame and conversion
-to occupancy are **PENDING** (CHECKLIST §5). Depth Anything is **not**
-integrated with Dev 3.
+**Note on 1..253 (not published).** These values only appear in Dev 3's
+unpublished `final` array. Dev 3's placeholder inflation rounds
+`253 · (1 − d / inflation_radius)`, so it can produce 253 (Nav2 INSCRIBED)
+without any inscribed-radius concept. That is one reason inflation is left
+to Nav2.
 
-## 7. What Dev 4 can assume
+## 4. Timestamp
 
-- Free cells represent traversable space.
-- Lethal cells represent obstacles / hazards.
-- Unknown cells represent unknown space. At the costmap level the project
-  says unknown is "never free" (ARCH §8.1, DEV §4 Dev 3 task 2).
-- Intermediate values may represent inflated cost near obstacles.
-- Geometry lethal has precedence over semantic traversable.
-- Global and local costmaps (`/global_costmap/costmap`,
-  `/local_costmap/costmap`) are the intended outputs.
-- Dev 4 consumes the costmaps (DEV §3) and outputs `/cmd_vel_nav2` (§10).
-- Costmaps are refreshed continuously from live mask (+ optional voxel)
-  updates. That is the v1 dynamic-obstacle mechanism (ARCH §11).
-
-## 8. What Dev 4 must NOT assume
-
-All of the following are **PENDING / TBD**:
-
-- final costmap frame(s)
-- final resolution
-- final map dimensions
-- final map origin
-- final update frequency
-- final internal-cost → `OccupancyGrid` conversion
-- final global / local extents
-- final inflation parameters (radius, decay curve; current decay is a placeholder)
-- final robot footprint (Dev 5 dual footprint YAMLs; not provided yet)
-- final camera extrinsics (Dev 5 robot description; not provided yet)
-- final TF lookup behaviour (API, timeout, stamp tolerance)
-- final stale-mask behaviour (ARCH §8.6 "front ROI lethal/max-inflate"; ROI and owner undefined)
-- a live geometry producer
-- final Nav2 integration architecture (layer plugin vs publisher, ROS 2 version:
-  PC says Lyrical, ARCH §6 says Jazzy/Humble)
-
-**Dev 2:** the documents specify that Dev 2 will provide the TF chain
-`map → odom → base_link` (≥ 15 Hz, jitter < 50 ms) and `/ugv/pose_valid`
-(consumed by Dev 5) (DEV §3, PC §3). There is no Dev 2 implementation in this
-workspace; do not assume any of it is available.
-
-## 9. Synthetic costmap testing for Dev 4
-
-Dev 4 can start now with synthetic costmaps built directly in Dev 3's internal
-semantics (§4), or generated with `costmap_core.pipeline.run_costmap_pipeline`
-from synthetic inputs. All grid sizes, resolutions and positions in
-such tests are test values, not project values.
-
-Suggested scenarios (test scenarios only):
-
-| Scenario | Content | What it tests |
-|---|---|---|
-| Empty / free map | all `0` | planning through open space |
-| Obstacle wall with opening | a line of `254` with a gap of `0` | routing through the available opening |
-| Corridor | `0` channel bounded by `254` | planning through constrained traversable space |
-| Unknown region | a block of `255` | Dev 4's chosen unknown-space behaviour, tested explicitly. The project defines unknown as "never free" at the costmap level. The planner's policy for unknown cells is **not** defined here. |
-| Inflated obstacle | `254` cells surrounded by `1..253` (e.g. from `inflation.inflate_costmap`) | planner behaviour around intermediate costs |
-| Dynamic obstacle update | a sequence of costmaps where `254` cells appear / move | reaction to changing costmap data (DEV Dev 4 task 3) |
-
-Minimal example (all values synthetic):
-
-```python
-import numpy as np
-FREE, LETHAL, UNKNOWN = 0, 254, 255
-grid = np.full((50, 50), FREE, dtype=np.int64)   # [row=y, col=x]
-grid[25, :] = LETHAL                             # wall
-grid[25, 20:24] = FREE                           # opening
-```
-
-## 10. Dev 4 downstream flow
-
-```
-Dev 3 costmaps → Dev 4 planner/controller (Smac2D + RPP) → /cmd_vel_nav2
-```
-
-- `/cmd_vel_nav2`: `geometry_msgs/msg/Twist`, published by Dev 4, consumed by
-  Dev 5 (DEV §3).
-- **Dev 5 is the final safety authority and sole owner of `/cmd_vel`**
-  (ARCH §3.1, DEV §3). Dev 4 never publishes `/cmd_vel` directly.
-
-## 11. Current Dev 3 status
-
-### Implemented (ROS-independent, `ugv_navigation/costmap_core/`)
-
-| Component | Module |
+| Publish path | `header.stamp` (= `info.map_load_time`) |
 |---|---|
-| Class → cost mapping | `class_to_cost.py` |
-| Semantic costmap (mask → same-shape costmap) | `semantic_costmap.py` |
-| Pixel → ground projection (pinhole, height + pitch) | `projection.py` |
-| Ground → grid cell conversion | `grid.py` |
-| Mask projection onto the grid | `mask_projection.py` |
-| Geometry costmap abstraction | `geometry_costmap.py` |
-| Semantic + geometry fusion (geometry lethal wins) | `costmap_fusion.py` |
-| Inflation | `inflation.py` |
-| Footprint validation / padding | `footprint.py` |
-| Input contracts | `contracts.py` |
-| Single pipeline entry point | `pipeline.py` |
-| Tests | `ugv_navigation/tests/`: **311 passed, 0 failed** |
+| Normal output for a mask | `output_stamp_source == "mask"`: that mask's header stamp (image capture time). `"now"`: the node clock when the costmap was built. |
+| Re-fused republish (a depth cloud arrived after its mask; §5) | `"mask"`: the **same** mask's stamp, so two messages can share a stamp with different content (the second has geometry fused). `"now"`: the node clock at the re-fusion. |
+| Fail-safe grid | **Always the node clock**, for either policy: no current mask exists. |
 
-The algorithms are implemented and tested with **synthetic inputs**. What's
-missing is live system integration.
+Consequence (tested): with `"mask"`, stamps are **not monotonic** across a
+fail-safe → recovery transition. The recovery grid carries its mask's capture
+time, which is older than the preceding fail-safe grid's node-clock stamp.
+**Consumers must treat the most recently received message as current, not
+the message with the largest stamp.** `output_stamp_source` is **PENDING**;
+the node clock is ROS time (sim time under `use_sim_time`).
 
-### Pending
+## 5. When the node publishes
 
-- ROS adapters (mask, CameraInfo, TF, parameters, output)
-- internal cost → `OccupancyGrid` conversion and Nav2 integration form
-- real frames, calibration, extrinsics, footprint
-- TF integration (Dev 2 TF chain + Dev 5 camera extrinsics)
-- live geometry producer
-- stale-mask fail-safe, freshness / stamp tolerance values
-- global/local costmap configuration
-- ROS 2 / Nav2 version resolution and the explicit go-ahead for ROS coding (ARCH §17)
-
-Full list: CHECKLIST §8–§10.
-
-## 12. Dev 4 can start now
-
-**Dev 4 can begin planner development and testing against synthetic
-costmaps now.** Dev 4 does not need to wait for:
-
-- ROS installation
-- a live Dev 1 → Dev 3 ROS adapter
-- live TF
-- final camera calibration
-- a live geometry producer
-- final Nav2 integration
-
-Synthetic testing does **not** mean the final ROS/Nav2 interface is frozen.
-Frames, resolution, extents, conversion to `OccupancyGrid`, and inflation
-parameters may all change.
-
-## 13. Pending interface table
-
-| Item | Status |
+| Trigger | Output |
 |---|---|
-| Global costmap topic | Intended |
-| Local costmap topic | Intended |
-| OccupancyGrid type | Intended |
-| Internal cost semantics | Implemented |
-| OccupancyGrid conversion | Pending |
-| Costmap frame | Pending |
-| Resolution | Pending |
-| Global extent | Pending |
-| Local extent | Pending |
-| Inflation parameters | Pending |
-| Robot footprint | Pending |
-| TF integration | Pending |
-| Live geometry producer | Pending |
-| ROS/Nav2 integration | Pending |
-| Dev 4 synthetic testing | Ready |
+| A mask arrives, passes `is_fresh(mask stamp, now, mask_max_age_s)`, and the pipeline succeeds | normal costmap |
+| A depth cloud arrives that pairs with the last processed mask better than before (same camera frame, `0 ≤ mask stamp − cloud stamp ≤ geometry.max_age_s`) and that mask is still fresh | the same mask's costmap re-fused with this geometry |
+| Fail-safe timer tick (`fail_safe.check_period_s`) while **no** mask that produced a costmap is fresh (including at startup) | fail-safe grid (§6) |
+| Anything else (stale mask arrives, adapter/TF/pipeline error, invalid cloud, stale or unpaired cloud) | nothing; logged |
+
+While the node runs with a valid clock, output never stops for longer than
+about `mask_max_age_s + fail_safe.check_period_s` plus processing time:
+either fresh masks produce normal output, or the fail-safe timer publishes.
+**Prolonged silence therefore means the node itself is not running (or the
+ROS clock is 0, e.g. sim time before the first `/clock`),** not that the
+environment is clear. A downstream timeout on message arrival detects that;
+the watchdog for it is Dev 5's (DEV Dev 5 task 2), not Dev 3's.
+
+## 6. Failure behaviour
+
+| Condition | Dev 3 output |
+|---|---|
+| Semantic mask stale or missing (including Dev 1 adapter failure, which stops Dev 1 publishing masks) | After the last good costmap ages past `mask_max_age_s`: fail-safe grid on every timer tick. Cells in `fail_safe.roi_*` are lethal, every other cell is unknown, **no cell is free**. (The fail-safe builder still applies `inflation_radius`, but with the default costs every non-ROI cell is unknown (255), which inflation never lowers, so no inflated value appears. This is tested in `tests/test_fail_safe.py`.) |
+| Fresh mask but processing fails (no/invalid CameraInfo, TF failure, contract violation) | No output for that mask; the fail-safe takes over once the last good costmap is stale. |
+| Geometry disabled (`geometry.enabled: false`) | Semantic-only costmap. |
+| Geometry missing, empty, stale (`mask stamp − cloud stamp > geometry.max_age_s`), future-dated, from another camera frame, or failed | Semantic-only costmap for that mask. It is identical to the geometry-disabled output. |
+| Geometry while in fail-safe | Not used: geometry is only fused into a fresh mask. The fail-safe grid is unchanged. |
+| Recovery (a fresh mask produces a costmap) | Normal output resumes at once; fail-safe ticks stop. |
+
+**Distinguishing a fail-safe grid.** The node publishes no separate flag. A
+fail-safe grid is recognisable only by content (ROI lethal, everything else
+unknown). The project's degraded-perception signal is Dev 1's
+`/ugv/perception_degraded`, consumed by Dev 5 (DEV §3). Dev 4 does not need
+to detect the fail-safe: its costs are conservative by construction.
+
+## 7. What Dev 4 can rely on
+
+- A standard `nav_msgs/OccupancyGrid` with the encoding in §3. No Dev 4 or
+  planner-specific field is used, and Dev 3 needs no knowledge of the
+  planner.
+- The frame, geometry and layout rules in §2.
+- Free (0) only where the semantic mask saw traversable ground and no
+  geometric obstacle exists. Unknown (−1) is never free. Lethal (100) covers
+  hazards, geometric obstacles and the fail-safe ROI.
+- Only the values 0, 100 and −1: no inflation. The consumer (Nav2
+  InflationLayer) must inflate.
+- The stamp rules in §4, including "latest arrival is current".
+- Continuous output while the node is alive (§5).
+
+## 8. What Dev 4 must not assume
+
+- Final topic names, frame names, resolution, extent, origin or update rate
+  (all **PENDING**; configurable, no defaults).
+- That the grid is robot-centred or rolling (it is fixed-origin).
+- Monotonic stamps under `output_stamp_source: mask` (§4).
+- Any inflation or footprint padding in the published costmap. There is
+  none; Nav2 owns it.
+- A footprint applied to cells. The robot footprint (Dev 5) is validated and
+  carried in the pipeline result but **not rasterised**; no project document
+  defines footprint rasterisation.
+- That a consumer's own unknown handling preserves "unknown ≠ free". For
+  example, Nav2 StaticLayer's default `track_unknown_space: false` turns −1
+  into free. The consumer must configure this.
+
+## 9. Synthetic testing for Dev 4
+
+Dev 4 can test against synthetic grids in the §3 encoding (0 / 100 / −1,
+non-inflated), or generate them with `costmap_core.pipeline.run_costmap_pipeline` (use `result.fused`) plus
+`costmap_ros.occupancy_grid.occupancy_grid_from_costmap`. Useful scenarios:
+free map; wall with an opening; corridor; unknown block (tests Dev 4's own
+unknown policy); an obstacle for Nav2's inflation to act on; a sequence where lethal cells appear or
+move; and a fail-safe-shaped grid (lethal rectangle, rest unknown). All grid
+sizes and values in such tests are test values, not project values.
+
+## 10. Open items (team decisions)
+
+| Item | Owner per documents |
+|---|---|
+| Nav2 integration form (StaticLayer / custom layer / Nav2 VoxelLayer for geometry) | not defined: team |
+| `output_stamp_source`, and whether stamps must be monotonic | not defined: team |
+| Topic names per costmap, frame names, grid geometry, global vs local extents, rolling vs fixed | Dev 3 `config/robots/` (frames with Dev 2) |
+| Nav2 InflationLayer parameters (radius, cost scaling) and the footprint they use. Dev 3 no longer inflates the published output. | Dev 3 config (DEV Dev 3 task 4) / Dev 5 footprint |
+| Whether the now-unused Dev 3 `inflation_radius` parameter (still required; it only feeds the unpublished `final` and the fail-safe builder) should be retired | team |
+| Footprint values and footprint → inflation rule | Dev 5 (values); team (rule) |
+| Fail-safe ROI extent, check period, "max-inflate" meaning, owner | not defined: team |
+| Publisher durability (volatile vs latched) | not defined: team |

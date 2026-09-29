@@ -13,6 +13,8 @@ real Dev 1 geometry/depth output into this simple boolean mask.
 import numpy as np
 from dataclasses import dataclass
 
+from costmap_core.class_to_cost import require_cost
+
 
 class GeometryCostmapError(ValueError):
     """Raised when occupied_mask is invalid.
@@ -29,10 +31,24 @@ class GeometryCostValues:
     Defaults follow Nav2's documented costmap_2d cost conventions
     (LETHAL_OBSTACLE=254, FREE_SPACE=0). These are still only defaults:
     construct a different GeometryCostValues to override them.
+
+    Validation (GeometryCostmapError): both are integer costs in 0..255
+    (class_to_cost.require_cost), and free_cost < lethal_cost -- equal
+    values would make occupied and free cells identical, and inflation
+    (decay from lethal - 1 down to 0) presumes free < lethal.
     """
 
     lethal_cost: int = 254
     free_cost: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("lethal_cost", "free_cost"):
+            value = require_cost(getattr(self, name), name=name, error=GeometryCostmapError)
+            object.__setattr__(self, name, value)
+        if not self.free_cost < self.lethal_cost:
+            raise GeometryCostmapError(
+                f"free_cost ({self.free_cost}) must be < lethal_cost ({self.lethal_cost})"
+            )
 
 
 DEFAULT_GEOMETRY_COST_VALUES = GeometryCostValues()

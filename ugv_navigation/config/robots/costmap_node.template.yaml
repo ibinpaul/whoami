@@ -1,0 +1,83 @@
+# Dev 3 costmap_node parameters: TEMPLATE, not a usable configuration.
+#
+# Copy this file per robot/costmap, replace every [TODO] and pass the copy to
+#   ros2 launch ugv_navigation costmap.launch.py params_file:=<copy>.yaml
+#
+# Every parameter is required by costmap_node and has no default
+# (costmap_ros/costmap_node.py: PARAMETERS, GEOMETRY_PARAMETERS,
+# FOOTPRINT_PARAMETERS). Placeholder: [TODO] is a string array, which is the
+# wrong type for every one of these parameters, so the node refuses to start
+# (InvalidParameterTypeException) while any placeholder is left. Do not
+# replace a placeholder with a guess; the owner in each comment decides it.
+#
+# Types: string, double, integer (grid.width/height), bool (*.enabled),
+# double array (footprint.vertices). Write doubles with a decimal point
+# (e.g. 2.0, not 2), or ROS loads them as integers and rejects them.
+
+costmap_node:
+  ros__parameters:
+    # --- Topics ---
+    mask_topic: /segmentation/mask              # confirmed: Dev 1 publisher (mono8, classes 0/1/2)
+    # Dev 1 republisher. CLAUDE.md still lists "/segmentation/camera_info vs
+    # the driver topic" as a PENDING team decision.
+    camera_info_topic: /segmentation/camera_info
+    # string. /global_costmap/costmap or /local_costmap/costmap (DEV §3); one
+    # node instance = one grid = one topic. Deployment choice, team.
+    costmap_topic: [TODO]
+
+    # --- Frames ---
+    # string. Costmap frame: TF target, grid frame and output header.frame_id;
+    # z = 0 on the ground plane. PENDING (Dev 2 TF tree).
+    target_frame: [TODO]
+
+    # --- Grid (fixed origin in target_frame) ---
+    grid:
+      resolution: [TODO]   # double, metres/cell, > 0. PENDING (config/robots, Dev 5)
+      origin_x: [TODO]     # double, metres in target_frame. PENDING
+      origin_y: [TODO]     # double, metres in target_frame. PENDING
+      width: [TODO]        # integer, cells, > 0. PENDING
+      height: [TODO]       # integer, cells, > 0. PENDING
+
+    # --- Timing / freshness ---
+    tf_timeout_s: [TODO]     # double, seconds, >= 0. PENDING (Dev 2 / Dev 5 TF lookup policy)
+    # double, seconds, > 0. Dev 3 max mask age. PENDING team decision
+    # (Dev 1's own perception_max_age 0.50 s is not automatically Dev 3's).
+    mask_max_age_s: [TODO]
+
+    # --- Costs ---
+    inflation_radius: [TODO]  # double, metres, >= 0. PENDING (config/robots, Dev 5)
+
+    # --- CameraInfo QoS ---
+    # string, "volatile" or "transient_local". Must match the publisher of
+    # camera_info_topic: Dev 1's /segmentation/camera_info is VOLATILE; the
+    # driver topic is expected to be TRANSIENT_LOCAL. Decided with the topic.
+    camera_info_durability: [TODO]
+
+    # --- Output stamp ---
+    # string, "mask" (image capture stamp) or "now" (node clock). PENDING team decision.
+    output_stamp_source: [TODO]
+
+    # --- Stale-mask fail-safe (architecture §8.6) ---
+    fail_safe:
+      roi_min_x: [TODO]       # double, metres in target_frame, inside the grid. PENDING (size and owner)
+      roi_max_x: [TODO]       # double. PENDING
+      roi_min_y: [TODO]       # double. PENDING
+      roi_max_y: [TODO]       # double. PENDING
+      check_period_s: [TODO]  # double, seconds, > 0. PENDING
+
+    # --- Geometry side-channel (optional) ---
+    geometry:
+      enabled: [TODO]   # bool. Team choice. The keys below are read only if true.
+      depth_cloud_topic: /perception/depth_cloud  # confirmed: Dev 1 publisher (PointCloud2)
+      min_height: [TODO]  # double, metres. PENDING team value
+      max_height: [TODO]  # double, metres. PENDING team value
+      min_range: [TODO]   # double, metres. PENDING team value
+      max_range: [TODO]   # double, metres. PENDING team value
+      max_age_s: [TODO]   # double, seconds, > 0 (mask stamp - cloud stamp). PENDING team value
+
+    # --- Robot footprint (optional; carried through, not rasterised) ---
+    footprint:
+      enabled: [TODO]   # bool. The keys below are read only if true.
+      vertices: [TODO]  # double array, flat [x0, y0, x1, y1, ...], metres, convex. Dev 5
+      frame_id: [TODO]  # string, robot frame of the vertices. Dev 5 / Dev 2
+      padding: [TODO]   # double, metres, >= 0. PENDING
